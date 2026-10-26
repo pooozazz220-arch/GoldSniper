@@ -18,10 +18,11 @@ jobs:
           python-version: '3.9'
 
       - name: Install dependencies
-        run: pip install yfinance pandas numpy requests
+        run: pip install -r requirements.txt
 
       - name: Run Gold Sniper
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
         run: python gold_sniper.py
