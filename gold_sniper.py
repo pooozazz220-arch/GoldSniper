@@ -1,102 +1,220 @@
+
+import os
+import time
+import json
 import requests
 import pandas as pd
-import numpy as np
-import os
-import datetime
+from datetime import datetime, timezone
 
-# خواندن کلیدها از گاوصندوق گیت‌هاب
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-CHAT_ID = os.environ.get('CHAT_ID')
-TWELVEDATA_API_KEY = os.environ.get('TWELVEDATA_API_KEY')
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+API_KEY = os.getenv("TWELVEDATA_API_KEY")
+
+SYMBOL = "XAU/USD"
+CHECK_SECONDS = 20
+
+# این سطح‌ها نمونه‌اند؛ با قیمت فعلی تنظیمشان کن
+LEVELS = [4156.0, 4165.0, 4175.0]
+
+# تنظیمات آزمایشی هشدار سریع
+JUMP_USD = 1.5
+JUMP_SECONDS = 60
+COOLDOWN_SECONDS = 300
+STATE_FILE = "gold_sniper_state.json"
+
+last_alert = {}
+recent_prices = []
+
 
 def send_telegram_message(text):
+    if not BOT_TOKEN or not CHAT_ID:
+        print("خطا: BOT_TOKEN یا CHAT_ID تنظیم نشده.")
+        return False
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+
     try:
-        requests.post(url, json=payload, timeout=10)
+        response = requests.post(
+            url,
+            json={"chat_id": CHAT_ID, "text": text},
+            timeout=10
+        )
+        response.raise_for_status()
+        return response.json().get("ok", False)
     except Exception as e:
-        print(f"خطا در ارسال: {e}")
+        print("خطا در تلگرام:", e)
+        return False
 
-def analyze_real_market():
-    # دریافت داده‌های 1 دقیقه‌ای از TwelveData برای طلا (XAU/USD)
-    url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1min&outputsize=500&apikey={TWELVEDATA_API_KEY}"
-    
-    try:
-        response = requests.get(url, timeout=15).json()
-        if 'values' not in response:
-            print(f"خطای API: {response.get('message', 'نامشخص')}")
-            return
-            
-        # تبدیل دیتا به دیتافریم پانداس
-        df = pd.DataFrame(response['values'])
-        df['datetime'] = pd.to_datetime(df['datetime'])
-        df.set_index('datetime', inplace=True)
-        
-        # مرتب‌سازی صعودی (از قدیم به جدید)
-        df = df.sort_index()
-        
-        # تبدیل ستون‌ها به عدد
-        for col in ['open', 'high', 'low', 'close']:
-            df[col] = df[col].astype(float)
 
-        # ۱. محاسبه کندل‌های M15 و نبض (Heartbeat)
-        df['Is_Green_M1'] = (df['close'] > df['open']).astype(int)
-        m15 = df.resample('15min').agg({
-            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last',
-            'Is_Green_M1': 'mean' 
-        }).dropna()
-        
-        m15.rename(columns={'Is_Green_M1': 'Heartbeat'}, inplace=True)
-        m15['M15_Direction'] = (m15['close'] > m15['open']).astype(int)
+def alert_once(key, message, cooldown=COOLDOWN_SECONDS):
+    now = time.time()
 
-        # استخراج آخرین کندل بسته شده
-        last_candle = m15.iloc[-2]
-        current_time = m15.index[-2]
-        entry_price = last_candle['close']
-        hb = last_candle['Heartbeat']
-        m15_dir = last_candle['M15_Direction']
+    if now - last_alert.get(key, 0) < cooldown:
+        return
 
-        print(f"Time: {current_time} | Price: {entry_price} | HB: {hb*100:.1f}% | Dir: {m15_dir}")
+    if send_telegram_message(message):
+        last_alert[key] = now
 
-        # قانون آسون‌تر برای سیگنال (همون نبض کندل خودمون)
-        signal_type = None
-        reason = ""
 
-        if m15_dir == 1 and hb < 0.45:
-            signal_type = "🟢 سیگنال خرید (BUY)"
-            reason = "کندل M15 سبز بسته شد و فشار فروش درون کندل وجود داشت (نبض پایین)."
-            stop_loss = last_candle['low'] - 1.0
-            risk = entry_price - stop_loss
-            take_profit = entry_price + (risk * 2)
+def get_latest_price():
+    url = "https://api.twelvedata.com/price"
 
-        elif m15_dir == 0 and hb > 0.55:
-            signal_type = "🔴 سیگنال فروش (SELL)"
-            reason = "کندل M15 قرمز بسته شد و فشار خرید درون کندل وجود داشت (نبض بالا)."
-            stop_loss = last_candle['high'] + 1.0
-            risk = stop_loss - entry_price
-            take_profit = entry_price - (risk * 2)
+    response = requests.get(
+        url,
+        params={
+            "symbol": SYMBOL,
+            "apikey": API_KEY
+        },
+        timeout=10
+    )
+    response.raise_for_status()
+    data = response.json()
 
-        # ارسال پیام در صورت وجود سیگنال
-        if signal_type:
-            final_message = (
-                f"⚡ <b>سیگنال طلای واقعی (Live XAUUSD)</b> ⚡\n\n"
-                f"🚨 <b>{signal_type}</b> 🚨\n"
-                f"⏰ <b>زمان:</b> {current_time.strftime('%H:%M')} (UTC)\n\n"
-                f"💲 <b>قیمت ورود:</b> {entry_price:.2f}\n"
-                f"🛑 <b>حد ضرر (SL):</b> {stop_loss:.2f}\n"
-                f"🎯 <b>حد سود (TP):</b> {take_profit:.2f}\n\n"
-                f"📊 <b>نبض کندل:</b> {hb*100:.1f}%\n"
-                f"📈 <b>جهت کندل:</b> {'سبز 🟢' if m15_dir == 1 else 'قرمز 🔴'}\n\n"
-                f"🎓 <b>درس:</b> {reason}\n"
-                f"⚖️ <i>مدیریت سرمایه فراموش نشود.</i>"
+    if "price" not in data:
+        raise RuntimeError(str(data))
+
+    return float(data["price"])
+
+
+def check_fast_alerts(price):
+    now = time.time()
+    recent_prices.append((now, price))
+
+    while recent_prices and now - recent_prices[0][0] > JUMP_SECONDS:
+        recent_prices.pop(0)
+
+    stamp = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
+    # هشدار عبور از سطح
+    if len(recent_prices) >= 2:
+        previous = recent_prices[-2][1]
+
+        for level in LEVELS:
+            if previous < level <= price:
+                alert_once(
+                    f"level_up_{level}",
+                    f"⚡ XAUUSD شکست رو به بالا\n"
+                    f"سطح: {level}\nقیمت: {price:.2f}\n{stamp}"
+                )
+
+            elif previous > level >= price:
+                alert_once(
+                    f"level_down_{level}",
+                    f"⚡ XAUUSD شکست رو به پایین\n"
+                    f"سطح: {level}\nقیمت: {price:.2f}\n{stamp}"
+                )
+
+    # هشدار جهش قیمت
+    if len(recent_prices) >= 2:
+        change = price - recent_prices[0][1]
+
+        if abs(change) >= JUMP_USD:
+            direction = "جهش صعودی" if change > 0 else "ریزش سریع"
+
+            alert_once(
+                "price_jump",
+                f"🚨 XAUUSD {direction}\n"
+                f"تغییر قیمت: {change:.2f}$\n"
+                f"قیمت فعلی: {price:.2f}\n{stamp}",
+                cooldown=180
             )
-            print("سیگنال شلیک شد!")
-            send_telegram_message(final_message)
-        else:
-            print("وضعیت خنثی است. پیامی ارسال نشد.")
 
-    except Exception as e:
-        print(f"خطا در پردازش دیتا: {e}")
+
+def check_m15_signal():
+    url = "https://api.twelvedata.com/time_series"
+
+    response = requests.get(
+        url,
+        params={
+            "symbol": SYMBOL,
+            "interval": "15min",
+            "outputsize": 60,
+            "timezone": "UTC",
+            "apikey": API_KEY
+        },
+        timeout=15
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    if "values" not in data:
+        raise RuntimeError(str(data))
+
+    df = pd.DataFrame(data["values"])
+    df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+
+    for col in ["open", "high", "low", "close"]:
+        df[col] = df[col].astype(float)
+
+    df = df.sort_values("datetime").reset_index(drop=True)
+
+    # فقط کندل‌هایی که زمان بسته‌شدنشان گذشته است
+    now = pd.Timestamp.now(tz="UTC")
+    df = df[df["datetime"] + pd.Timedelta(minutes=15) <= now]
+
+    if len(df) < 22:
+        return
+
+    # جلوگیری از هشدار تکراری روی همان کندل
+    candle_time = df.iloc[-1]["datetime"].isoformat()
+
+    if last_alert.get("last_m15_candle") == candle_time:
+        return
+
+    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+
+    candle = df.iloc[-1]
+    previous = df.iloc[-2]
+
+    direction = None
+
+    if candle["close"] > candle["open"] and candle["close"] > candle["ema20"]:
+        direction = "BUY"
+
+    elif candle["close"] < candle["open"] and candle["close"] < candle["ema20"]:
+        direction = "SELL"
+
+    if direction:
+        message = (
+            f"📊 هشدار تکنیکال XAUUSD: {direction}\n"
+            f"زمان کندل: {candle_time}\n"
+            f"قیمت بسته‌شدن: {candle['close']:.2f}\n"
+            f"EMA20: {candle['ema20']:.2f}\n"
+            "این هشدار به‌تنهایی تأیید ورود نیست؛ "
+            "حد ضرر و ریسک را بررسی کن."
+        )
+
+        if send_telegram_message(message):
+            last_alert["last_m15_candle"] = candle_time
+    else:
+        last_alert["last_m15_candle"] = candle_time
+
+
+def main():
+    if not API_KEY:
+        raise SystemExit("متغیر TWELVEDATA_API_KEY تنظیم نشده است.")
+
+    print("GoldSniper شروع شد؛ برای توقف Ctrl+C را بزن.")
+
+    last_m15_check = 0
+
+    while True:
+        try:
+            price = get_latest_price()
+            print("XAUUSD:", price)
+
+            check_fast_alerts(price)
+
+            # بررسی تکنیکال هر 60 ثانیه
+            if time.time() - last_m15_check >= 60:
+                check_m15_signal()
+                last_m15_check = time.time()
+
+        except Exception as e:
+            print("خطا:", e)
+
+        time.sleep(CHECK_SECONDS)
+
 
 if __name__ == "__main__":
-    analyze_real_market()
+    main()
